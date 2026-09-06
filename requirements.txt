@@ -1,0 +1,6 @@
+numpy>=1.26
+pandas>=2.1
+PyYAML>=6.0
+requests>=2.31
+pyarrow>=14.0      # parquet 缓存（Tushare 源）
+tushare>=1.4.0     # 可选：真实数据源

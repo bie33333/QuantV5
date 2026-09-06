@@ -1,0 +1,237 @@
+# =====================================================================
+# LimitUp_Factor_Model v2.0 · A股涨停接力量化策略 —— 唯一事实源配置
+# 依据 chat.md 策略定义书（39节规则）+ 经典知行参数集实现；改参数不改代码。
+# 经典参数集（用户指定）：单只40% / 最多2只 / 止损5% / 止盈15%-回撤6%
+#   / 持有≤15日 / 账户回撤熔断12% / 弱市空仓(指数≤MA20不交易) / 连板晋级率≥30%。
+# =====================================================================
+
+meta:
+  model_name: "LimitUp_Factor_Model_v2.0"
+  version: "2.1.0"                 # 2.1: 切换经典知行风控参数集（右侧止盈+组合熔断）
+
+# ----------------------------- 数据源 -----------------------------
+# source: synthetic | tushare
+#   - synthetic: 内置合成数据生成器，全字段可用，保证流水线端到端可跑
+#   - tushare : 真实日线/每日指标；分钟/封单/龙虎榜等缺失字段按
+#               augmentation_mode 补齐（文档中标注为 ESTIMATED）
+# tushare token 优先级: 环境变量 TUSHARE_TOKEN > 此处 tushare.token
+data:
+  source: "synthetic"
+  tushare:
+    token: ""                                                                             # 留空则读环境变量 TUSHARE_TOKEN（token 属敏感凭据，不入库）
+    # 基础字段是否真实拉取（daily/daily_basic/stock_basic）
+    real_fields: ["daily", "daily_basic", "stock_basic"]
+  augmentation_mode: "estimate"   # estimate: 缺失的高频字段用日线估计值(标注可靠性)
+  synthetic:
+    n_stocks: 320              # 合成股票数
+    start: "2023-01-02"
+    end: "2025-09-30"
+    seed: 20260906
+  universe:
+    min_price: 3.0             # 收盘价下限（元）
+    max_price: 200.0
+    min_list_days: 60          # 上市不足 N 交易日剔除（合成源忽略）
+    exclude_st: true
+    max_amount_yi: 60.0        # 成交额上限(亿元)，排除大体量
+
+# ----------------------------- 涨跌停规则 -----------------------------
+# limit_pct 为股票级动态字段（规则参数化，不硬编码）
+limit_rules:
+  main: 0.10                   # 沪深主板
+  gem: 0.20                    # 创业板 300/301
+  star: 0.20                   # 科创板 688
+  bj: 0.30                     # 北交所 8xx/4xx（默认不纳入池）
+  st_main: 0.05                # 主板风险警示（上交所 2026-07-06 起调整为 0.10）
+  st_gem_star: 0.20            # 创业板/科创板风险警示仍按 20%（近似）
+  st_main_sse_date: "2026-07-06"  # 上交所主板风险警示规则变更生效日
+  new_stock_no_limit_days: 5   # 上市前N日无涨跌幅限制（近似按 limit_pct 处理，仅用于行情识别）
+
+# ----------------------------- 市场情绪层 -----------------------------
+# 注意：经典参数集下，交易硬闸门由 market.filter（等权指数>MA20 且 晋级率≥30%）承担，
+#       情绪层仍计算 sentiment/regime 用于 选股/看板/诊断，不再作硬闸门与仓位缩放。
+market:
+  weights:                     # 合计100
+    limit_up_count: 15
+    limit_down_count: 10       # 越低越好（反向）
+    promotion_rate: 15
+    yesterday_lu_avg_ret: 15
+    yesterday_lb_avg_ret: 15
+    break_rate: 10             # 越低越好（反向）
+    highest_board: 10
+    lianban_count: 10
+  adaptive_window: 60          # 自适应百分位锚点：过去60个交易日
+  regimes:                     # [下界, 上界)
+    VERY_STRONG: [80, 101]
+    STRONG:      [65, 80]
+    NORMAL:      [50, 65]
+    WEAK:        [35, 50]
+    FROZEN:      [0, 35]
+  permission:                  # 经典参数集：全放开（硬闸门见 market.filter）
+    VERY_STRONG: true
+    STRONG: true
+    NORMAL: true
+    WEAK: true
+    FROZEN: true
+  position_multiplier:         # 经典参数集：情绪不再缩放单票仓位（恒为1.0）
+    VERY_STRONG: 1.0
+    STRONG: 1.0
+    NORMAL: 1.0
+    WEAK: 1.0
+    FROZEN: 1.0
+  filter:                      # ★ 开仓硬闸门（弱市空仓 + 连板晋级率过滤）
+    enabled: true
+    index:                     # 无指数行情源时用「全组合收盘价等权均值」作指数代理
+      proxy: "equal_weight"    # equal_weight: 等权价格指数（价格水平 + MA20）
+      ma_period: 20            # 指数 ≤ MA20 → 不交易
+    limit_up_promotion:        # 连板晋级率过滤
+      enabled: true
+      min_promote_ratio: 0.30  # 昨日涨停股今日续板占比 ≥ 30% 才允许打板
+
+# ----------------------------- 板块强度层 -----------------------------
+theme:
+  weights:                     # 合计100
+    limit_up_count: 20
+    ret_3d: 15
+    ret_5d: 10
+    amount_growth: 15
+    market_share: 10           # 板块涨停占全市场比例
+    lianban_count: 10
+    highest_board: 10
+    promotion_rate: 10
+  persistence:
+    window: 5                  # 过去5日
+    weights: [1, 2, 3, 4, 5]   # 最近日权重最高
+    blend: 0.5                 # final = blend*当日raw + (1-blend)*persistence
+  min_score: 50.0              # 板块闸门（HARD_FILTER）
+
+# ----------------------------- 个股评分层（合计100） -----------------------------
+stock:
+  weights:
+    market_position: 20        # 龙头/市场地位
+    theme_strength: 15         # 所属板块强度（取自 theme 层当日分）
+    board_structure: 10        # 连板结构
+    turnover: 10               # 换手结构
+    volume_price: 8            # 量价关系
+    board_quality: 8           # 封板质量
+    next_day_premium: 7        # 历史次日溢价
+    money_flow: 5              # 资金结构（龙虎榜）
+    market_cap: 2              # 市值（辅助）
+    auction: 15                # 竞价强度（仅T日9:25模型，盘前模型不含）
+  min_score: 70.0              # 个股买入闸门（9:25终版分数）。
+                               # 注：规格书以75为例并说明“不是神奇数字”，
+                               # 本基线按研究需要设70（70~75分按半仓参与），
+                               # 正式阈值建议通过 walk-forward 网格寻优。
+  min_leadership: 8.0          # 龙头地位最低阈值
+  board_structure_base:        # 连板基础分
+    "1": 4
+    "2": 10
+    "3": 10
+    "4": 8
+    "5": 5
+    "6": 0                     # >=6板视为0
+  relative_height_penalty:     # 市场最高板>=N 且个股<=M板 时打折
+    market_top: 6
+    stock_below: 3
+    factor: 0.5
+  turnover_bands:              # 相对换手区间 → 得分
+    - [0.0, 0.8, 0]
+    - [0.8, 1.2, 3]
+    - [1.2, 2.0, 7]
+    - [2.0, 3.5, 10]
+    - [3.5, 5.0, 5]
+    - [5.0, 999.0, 0]
+  market_cap_yi:               # 总市值(亿元) → 得分
+    - [20, 50, 2]
+    - [50, 100, 1]
+    - [100, 200, 0]
+    - [200, 1e9, 0]
+
+# ----------------------------- 竞价层（T日 9:25） -----------------------------
+auction:
+  min_score: 6.0               # 竞价分下限（HARD_FILTER）
+  hard_reject_below: -0.03     # 竞价涨幅 < -3% 直接否决
+  one_word_low: 0.095          # 竞价涨幅>=9.5%（近一字）按过热处理
+  rules:                       # 竞价涨幅区间 → 得分(0~15)
+    - [0.04, 0.08, 14]         # 健康高开
+    - [0.00, 0.04, 11]         # 温和
+    - [-0.02, 0.00, 6]         # 平开微低
+    - [-0.03, -0.02, 3]        # 明显低开
+    - [0.08, 0.095, 10]        # 过高（透支警惕）
+    - [0.095, 1.0, 6]          # 近一字/一字
+  exec_bonus:                  # 竞价健康度对成交概率的修正
+    healthy: 0.10              # ar∈[0.02,0.08]
+    overheated: -0.10
+
+# ----------------------------- 成交模拟层 -----------------------------
+execution:
+  order_time: "09:25:30"       # 信号确认后挂单时点（模拟）
+  base_fill_prob:
+    sealed_close: 0.55         # 当日收盘仍封死（非一字开）时的基准成交概率
+    sealed_one_word: 0.12      # 一字开并封死：仅炸板/撤单带来成交机会
+    not_sealed: 0.0            # 当日未封板：不打板
+  partial_lot_ratio: 0.5       # 中等概率成交时按目标量50%部分成交
+  min_exec_prob: 0.30          # 成交概率 < 30% 否决（HARD_FILTER）
+  queue_shares_cap: 500000     # 单笔委托股数上限（用于排队深度估计）
+  rng_seed: 20260906
+
+# ----------------------------- 仓位与风控（经典参数集） -----------------------------
+position:
+  initial_capital: 500000.0
+  lot_size: 100
+  single_max: 0.40             # ★ 单票最大仓位 40%
+  max_positions: 2             # ★ 最大持仓 2 只
+  theme_cap: 0.80              # 同题材总仓位上限 80%（容纳 2×40%）
+  grade:                       # 信号分级 → 目标仓位基数（经典集不再乘情绪缩放）
+    A: 0.40                    # score>=85 或 强信号 → 目标 40%
+    B: 0.40                    # 70~85 通过即同按 40% 目标（分级仅作记录）
+    C: 0.0                     # <70（未过闸）不交易
+  grade_caps:                  # 分级硬顶
+    A: 0.40
+    B: 0.40
+    C: 0.0
+  exec_p_factor: [1.0, 0.0]    # 经典集：目标仓位不按成交概率打折（target = base×1.0）
+
+# ----------------------------- 组合熔断 -----------------------------
+circuit_breaker:
+  enabled: true
+  max_dd_exit: 0.12            # ★ 账户权益自峰值回撤 ≥12% → 全部清仓、空仓等待
+  recovery: "index_above_ma"   # 等权指数重新站上 MA20 即解除熔断并恢复交易（同时重置权益峰值基线）
+
+# ----------------------------- 退出层（经典三级出场） -----------------------------
+exit:
+  stop_loss: 0.05              # ① 硬止损：当日最低 ≤ 成本×0.95 → 卖出价=min(开盘, 止损价)
+  trail_trigger: 0.15          # ② 右侧止盈触发：持仓峰值 ≥ 成本×1.15 后启用移动止盈
+  trail_drop: 0.06             #   自峰值回撤 ≥6%（当日最低 ≤ 峰值×0.94）→ 卖出价=min(开盘, 峰值×0.94)
+  max_hold_days: 15            # ③ 时间强平：持仓满 15 交易日 → 当日开盘价卖出
+  sell_one_word_down: true     # 一字跌停封死（无法卖出）→ 顺延至可卖日（最多自然顺延）
+
+# ----------------------------- 成本模型 -----------------------------
+cost:
+  commission: 0.00025          # 佣金 万2.5
+  min_commission: 5.0          # 最低佣金 5 元
+  stamp_duty: 0.0005           # 印花税（卖出，2023-08 后 0.05%）
+  slippage: 0.001              # 滑点 0.1%（买卖双向计入）
+
+# ----------------------------- 回测 -----------------------------
+backtest:
+  start: "2023-01-01"
+  end: "2025-09-30"
+  date_format: "%Y-%m-%d"
+  bench: null                  # 基准（如 000300.SH），缺省不拉取
+  walk_forward:
+    enabled: false
+    train_years: 3
+    test_years: 1
+  ablation: true               # Model A/B/C/D 消融对比
+  tune:                        # 阈值网格搜索（train 段内寻优，test 段验证）
+    enabled: false
+    grid:
+      stock_min: [70, 75, 80]
+      theme_min: [45, 50, 55]
+      auction_min: [6, 8, 10]
+
+# ----------------------------- 报表 -----------------------------
+report:
+  out_dir: "outputs"
+  result_json: "result.json"
+  dashboard_html: "dashboard.html"

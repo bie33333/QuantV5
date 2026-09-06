@@ -1,0 +1,12 @@
+# 本地缓存与产物
+outputs/
+webapp/assets/
+.tmp_assets/
+.data_cache/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# WorkBuddy 工作数据（每日日志/记忆，不随代码分发）
+.workbuddy/
